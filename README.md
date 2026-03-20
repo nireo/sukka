@@ -2,12 +2,7 @@
 
 `sukka` is a tiny SOCKS5 proxy server written in Go.
 
-It supports:
-
-- no-auth SOCKS5 negotiation
-- `CONNECT` requests
-- IPv4, IPv6, and domain targets
-- configurable server address, logger, and dial function
+It supports: no-auth SOCKS5 negotiation, `CONNECT` requests and IPv4, IPv6, and domain targets.
 
 Example:
 
