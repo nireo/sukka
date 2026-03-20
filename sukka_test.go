@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -148,6 +149,99 @@ func TestHandleConnConnectAndRelay(t *testing.T) {
 	}
 }
 
+func TestServerServeLogsConnectionErrors(t *testing.T) {
+	var logs bytes.Buffer
+	s := &Server{Logger: log.New(&logs, "", 0)}
+	proxyAddr, closeProxy := startServing(t, s)
+	defer closeProxy()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	setDeadline(t, conn)
+
+	if _, err := conn.Write([]byte{0x04, 0x00}); err != nil {
+		t.Fatalf("write invalid greeting: %v", err)
+	}
+
+	waitFor(t, func() bool {
+		return strings.Contains(logs.String(), ErrUnsupportedVersion.Error())
+	})
+}
+
+func TestServerServeDomainConnectHTTP(t *testing.T) {
+	targetAddr, closeTarget := startHTTPServer(t, "tcp", "127.0.0.1:0")
+	defer closeTarget()
+
+	proxyAddr, closeProxy := startServing(t, &Server{})
+	defer closeProxy()
+
+	conn := connectThroughSOCKS(t, proxyAddr, buildDomainRequest(t, hostPortWithHost(t, targetAddr, "localhost"), commandConnect))
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")); err != nil {
+		t.Fatalf("write http request: %v", err)
+	}
+
+	response, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read http response: %v", err)
+	}
+
+	if !bytes.Contains(response, []byte("HTTP/1.1 200 OK")) {
+		t.Fatalf("unexpected response status: %q", response)
+	}
+
+	if !bytes.Contains(response, []byte("ok")) {
+		t.Fatalf("unexpected response body: %q", response)
+	}
+}
+
+func TestServerServeIPv4Connect(t *testing.T) {
+	targetAddr, closeTarget := startEchoServer(t)
+	defer closeTarget()
+
+	proxyAddr, closeProxy := startServing(t, &Server{})
+	defer closeProxy()
+
+	conn := connectThroughSOCKS(t, proxyAddr, buildIPv4Request(t, targetAddr, commandConnect))
+	defer conn.Close()
+
+	payload := []byte("hello over ipv4")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	if got := readN(t, conn, len(payload)); !bytes.Equal(got, payload) {
+		t.Fatalf("unexpected relayed payload: got %q want %q", got, payload)
+	}
+}
+
+func TestServerServeIPv6Connect(t *testing.T) {
+	targetAddr, closeTarget, err := startNetworkEchoServer("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("ipv6 not available: %v", err)
+	}
+	defer closeTarget()
+
+	proxyAddr, closeProxy := startServing(t, &Server{})
+	defer closeProxy()
+
+	conn := connectThroughSOCKS(t, proxyAddr, buildIPv6Request(t, targetAddr, commandConnect))
+	defer conn.Close()
+
+	payload := []byte("hello over ipv6")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	if got := readN(t, conn, len(payload)); !bytes.Equal(got, payload) {
+		t.Fatalf("unexpected relayed payload: got %q want %q", got, payload)
+	}
+}
+
 func TestReadRequestDomainAddress(t *testing.T) {
 	client, serverSide := net.Pipe()
 	defer client.Close()
@@ -267,6 +361,52 @@ func TestServerDialConnUsesCustomDial(t *testing.T) {
 	}
 }
 
+func TestServerServeUsesCustomDial(t *testing.T) {
+	called := make(chan struct{}, 1)
+	s := &Server{
+		Dial: func(network, address string) (net.Conn, error) {
+			if network != "tcp" {
+				t.Fatalf("unexpected network: %q", network)
+			}
+
+			if address != "example.com:80" {
+				t.Fatalf("unexpected address: %q", address)
+			}
+
+			client, upstream := net.Pipe()
+			called <- struct{}{}
+
+			go func() {
+				defer upstream.Close()
+				_, _ = io.Copy(upstream, upstream)
+			}()
+
+			return client, nil
+		},
+	}
+
+	proxyAddr, closeProxy := startServing(t, s)
+	defer closeProxy()
+
+	conn := connectThroughSOCKS(t, proxyAddr, buildDomainRequest(t, "example.com:80", commandConnect))
+	defer conn.Close()
+
+	select {
+	case <-called:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for custom dial")
+	}
+
+	payload := []byte("hello through custom dial")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	if got := readN(t, conn, len(payload)); !bytes.Equal(got, payload) {
+		t.Fatalf("unexpected relayed payload: got %q want %q", got, payload)
+	}
+}
+
 func TestServerServeNilListener(t *testing.T) {
 	if err := new(Server).Serve(nil); !errors.Is(err, ErrNilListener) {
 		t.Fatalf("expected nil listener error, got: %v", err)
@@ -288,6 +428,57 @@ func startHandleConn(t *testing.T, s *Server) (net.Conn, <-chan error) {
 	}()
 
 	return client, errCh
+}
+
+func startServing(t *testing.T, s *Server) (string, func()) {
+	t.Helper()
+
+	if s.Logger == nil {
+		s.Logger = log.New(io.Discard, "", 0)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy server: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Serve(ln)
+	}()
+
+	cleanup := func() {
+		_ = ln.Close()
+		if err := waitErr(t, errCh); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("serve returned unexpected error: %v", err)
+		}
+	}
+
+	return ln.Addr().String(), cleanup
+}
+
+func connectThroughSOCKS(t *testing.T, proxyAddr string, request []byte) net.Conn {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	setDeadline(t, conn)
+
+	performHandshake(t, conn)
+
+	if _, err := conn.Write(request); err != nil {
+		_ = conn.Close()
+		t.Fatalf("write connect request: %v", err)
+	}
+
+	if reply := readReplyCode(t, conn); reply != replySucceeded {
+		_ = conn.Close()
+		t.Fatalf("expected success reply, got: 0x%02x", reply)
+	}
+
+	return conn
 }
 
 func performHandshake(t *testing.T, c net.Conn) {
@@ -323,6 +514,55 @@ func buildIPv4Request(t *testing.T, destination string, command byte) []byte {
 
 	request := []byte{socksVersion, command, 0x00, addressTypeIPv4}
 	request = append(request, ip4...)
+	request = append(request, byte(port>>8), byte(port))
+
+	return request
+}
+
+func buildDomainRequest(t *testing.T, destination string, command byte) []byte {
+	t.Helper()
+
+	host, portStr, err := net.SplitHostPort(destination)
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+
+	if len(host) > 255 {
+		t.Fatalf("domain too long: %q", host)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	request := []byte{socksVersion, command, reservedByte, addressTypeDomain, byte(len(host))}
+	request = append(request, []byte(host)...)
+	request = append(request, byte(port>>8), byte(port))
+
+	return request
+}
+
+func buildIPv6Request(t *testing.T, destination string, command byte) []byte {
+	t.Helper()
+
+	host, portStr, err := net.SplitHostPort(destination)
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+
+	ip := net.ParseIP(host).To16()
+	if ip == nil || ip.To4() != nil {
+		t.Fatalf("destination is not ipv6: %q", destination)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+
+	request := []byte{socksVersion, command, reservedByte, addressTypeIPv6}
+	request = append(request, ip...)
 	request = append(request, byte(port>>8), byte(port))
 
 	return request
@@ -394,9 +634,18 @@ func setDeadline(t *testing.T, c net.Conn) {
 func startEchoServer(t *testing.T) (string, func()) {
 	t.Helper()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	addr, cleanup, err := startNetworkEchoServer("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen echo server: %v", err)
+	}
+
+	return addr, cleanup
+}
+
+func startNetworkEchoServer(network, address string) (string, func(), error) {
+	ln, err := net.Listen(network, address)
+	if err != nil {
+		return "", nil, err
 	}
 
 	done := make(chan struct{})
@@ -415,13 +664,68 @@ func startEchoServer(t *testing.T) (string, func()) {
 
 	cleanup := func() {
 		_ = ln.Close()
+		<-done
+	}
 
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Fatal("timeout closing echo server")
+	return ln.Addr().String(), cleanup, nil
+}
+
+func startHTTPServer(t *testing.T, network, address string) (string, func()) {
+	t.Helper()
+
+	ln, err := net.Listen(network, address)
+	if err != nil {
+		t.Fatalf("listen http server: %v", err)
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		conn, err := ln.Accept()
+		if err != nil {
+			return
 		}
+		defer conn.Close()
+
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+		buf := make([]byte, 1024)
+		_, _ = conn.Read(buf)
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+	}()
+
+	cleanup := func() {
+		_ = ln.Close()
+		<-done
 	}
 
 	return ln.Addr().String(), cleanup
+}
+
+func hostPortWithHost(t *testing.T, address, host string) string {
+	t.Helper()
+
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+
+	return net.JoinHostPort(host, port)
+}
+
+func waitFor(t *testing.T, fn func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("timeout waiting for condition")
 }
